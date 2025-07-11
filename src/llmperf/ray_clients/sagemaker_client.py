@@ -35,10 +35,6 @@ class SageMakerClient(LLMClient):
         prompt = request_config.prompt
         prompt, prompt_len = prompt
 
-        message = [
-            {"role": "system", "content": ""},
-            {"role": "user", "content": prompt},
-        ]
         model = request_config.model
         sm_runtime = boto3.client(
             "sagemaker-runtime", region_name=os.environ.get("AWS_REGION_NAME")
@@ -51,26 +47,25 @@ class SageMakerClient(LLMClient):
             del sampling_params["max_tokens"]
 
         message = {
-            "inputs": [
-                [
-                    {"role": "system", "content": ""},
-                    {"role": "user", "content": prompt},
-                ]
-            ],
+            "inputs": prompt,
             "parameters": {
                 **request_config.sampling_params,
             },
+            "stream": True,
         }
 
         time_to_next_token = []
         tokens_received = 0
         ttft = 0
-        error_response_code = None
+        error_response_code = -1
         generated_text = ""
         error_msg = ""
         output_throughput = 0
         total_request_time = 0
         metrics = {}
+
+        metrics[common_metrics.ERROR_CODE] = None
+        metrics[common_metrics.ERROR_MSG] = ""
 
         start_time = time.monotonic()
         most_recent_received_token_time = time.monotonic()
@@ -82,31 +77,53 @@ class SageMakerClient(LLMClient):
                 Body=json.dumps(message),
                 CustomAttributes="accept_eula=true",
             )
-
+            
             event_stream = response["Body"]
-            json_byte = b""
-            for line, ttft, _ in LineIterator(event_stream):
-                json_byte += line
-                time_to_next_token.append(
-                    time.monotonic() - most_recent_received_token_time
-                )
-                most_recent_received_token_time = time.monotonic()
-            ttft = ttft - start_time
-            resp = json.loads(json_byte)
+
+            generated_text = ""
+            start_json = b'{'
+            tokens_received = 0
+
+            for line, line_ttft, _ in LineIterator(event_stream):
+                if line != b'' and start_json in line:
+                    json_start = line.find(start_json)
+                    json_data = line[json_start:].decode('utf-8')
+                    data = json.loads(json_data)
+                    if 'token' in data and 'text' in data['token']:
+                        token_text = data['token']['text']
+                        generated_text += token_text
+                        tokens_received += 1
+
+                        if tokens_received == 1:
+                            # First token - use LineIterator's TTFT
+                            ttft = line_ttft - start_time
+                            time_to_next_token.append(ttft)
+                        else:
+                            # Subsequent tokens - calculate inter-token latency
+                            time_to_next_token.append(
+                                time.monotonic() - most_recent_received_token_time
+                            )
+                        most_recent_received_token_time = time.monotonic()
             total_request_time = time.monotonic() - start_time
-            generated_text = resp[0]["generation"]["content"]
-            tokens_received = len(self.tokenizer.encode(generated_text))
-            output_throughput = tokens_received / total_request_time
+
+            if generated_text:
+                # Use the tokenizer to get accurate token count
+                tokens_received = len(self.tokenizer.encode(generated_text))
+                output_throughput = tokens_received / total_request_time if total_request_time > 0 else 0
+            else:
+                print("No generated text found in stream")
 
         except Exception as e:
-            print(f"Warning Or Error: {e}")
-            print(error_response_code)
             error_msg = str(e)
             error_response_code = 500
-
-        metrics[common_metrics.ERROR_MSG] = error_msg
-        metrics[common_metrics.ERROR_CODE] = error_response_code
-        metrics[common_metrics.INTER_TOKEN_LAT] = time_to_next_token
+            print(f"Warning Or Error: {e}")
+            print(error_response_code)
+            metrics[common_metrics.ERROR_MSG] = error_msg
+            metrics[common_metrics.ERROR_CODE] = error_response_code
+        else:
+            # Success case - ensure error metrics remain None
+            print(f"Success: Generated {tokens_received} tokens, text: '{generated_text[:50]}...'")
+        metrics[common_metrics.INTER_TOKEN_LAT] = sum(time_to_next_token)
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
         metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput
