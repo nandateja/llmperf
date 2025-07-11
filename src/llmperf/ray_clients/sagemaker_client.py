@@ -120,9 +120,7 @@ class SageMakerClient(LLMClient):
             print(error_response_code)
             metrics[common_metrics.ERROR_MSG] = error_msg
             metrics[common_metrics.ERROR_CODE] = error_response_code
-        else:
-            # Success case - ensure error metrics remain None
-            print(f"Success: Generated {tokens_received} tokens, text: '{generated_text[:50]}...'")
+            
         metrics[common_metrics.INTER_TOKEN_LAT] = sum(time_to_next_token)
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
